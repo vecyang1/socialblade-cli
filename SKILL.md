@@ -67,6 +67,29 @@ socialblade search vecyang --platform youtube
 socialblade watch youtube:@vecyang --iterations 1 --tier bridge
 ```
 
+## Gotchas & API Boundaries
+
+Applying `skill-creator § Choosing the Rung`:
+
+1. **Twitter / X Discontinuation (Rung 1 Code + Rung 2 Skill)**:
+   - *Condition*: Social Blade permanently discontinued Twitter/X tracking (`HTTP 404` on both Matrix API and Web).
+   - *Behavior*: Attempting direct scraping yields 404 errors. `socialblade` automatically catches Twitter targets and delegates to Tier 3 (`tikhub-twitter` / `TIKHUB_API_KEY`) plus the local SQLite SSOT ledger.
+2. **Post-Level Endpoints Require Paid Business API (Rung 1 Code + Rung 2 Skill)**:
+   - *Condition*: Social Blade Matrix API `videos` endpoint returns `HTTP 401 Unauthorized` for free or unauthenticated tiers.
+   - *Behavior*: `socialblade posts` automatically routes to native platform bridges (`yt-data` for YouTube, TikHub for Twitter/X) to retrieve live video/tweet metrics without paid API locks.
+3. **Cloudflare Turnstile & Ad-Auction Overhead (Rung 1 Code)**:
+   - *Condition*: Navigating directly to `socialblade.com/youtube/user/*` triggers aggressive Cloudflare verification and heavy ad-auction scripts.
+   - *Behavior*: Tier 2 anchors on `https://socialblade.com/robots.txt` (zero ad overhead) and evaluates Next.js `/api/trpc/*` endpoints directly inside `page.evaluate()`.
+
+## Cadence & Scheduled Automation Policy
+
+Applying `scheduled-task-rescheduler § Anti-Fragmentation & SaaS Tracking Invariant` and `wheel-check § Reuse Ladder`:
+
+- **Zero-Isolated-Sidecar Invariant**: **SKIP** creating dedicated, standalone cron/launchd daemons for Social Blade alone. Isolated single-SaaS scrapers lead to ghost logic, token waste, and unmonitored failures.
+- **Native Polling via CLI**: For developer/operator monitoring loops, use the built-in `socialblade watch <target> --interval <seconds> --iterations <N>` command.
+- **Portfolio-Level Integration**: When recurring creator growth tracking is needed across accounts, integrate `socialblade` into existing multi-platform cadences (such as `CAD-20261023-portfolio-traffic-signal-journey-report` or `daily-intel-radar`) rather than creating isolated sidecars.
+- **SSOT Ledger Hygiene**: Point-in-time observations are safely committed to `~/.local/share/socialblade-cli/snapshots.db`, with daily/weekly deltas derived on read after Read-After-Write verification.
+
 ## Verification Commands
 
 ```bash
@@ -80,6 +103,9 @@ socialblade diagnose
 
 ## Related Skills
 
+- [scheduled-task-rescheduler](../scheduled-task-rescheduler/SKILL.md): Owns cadence lifecycle, anti-fragmentation invariants, and scheduled task audits.
+- [wheel-check](../wheel-check/SKILL.md): Owns the reuse ladder and anti-duplication protocols.
+- [skill-creator](../skill-creator/SKILL.md): Owns Choosing the Rung and the Owner Surface Triad.
 - [tikhub-social-data](../tikhub-social-data/SKILL.md): Owns `tikhub-twitter` used by Tier 3 Twitter/X bridge.
 - [youtube-data-cli](../youtube-data-cli/SKILL.md): Owns `yt-data` used by Tier 3 YouTube fallback and video-level inspection.
 - [ego-browser](../ego-browser/SKILL.md): Owns the local Chromium session used by Tier 2 `ego_trpc` extraction.

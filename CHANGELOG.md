@@ -2,6 +2,16 @@
 
 All notable changes to `socialblade-cli` (`socialblade`) are documented in this file.
 
+## [1.2.1] - 2026-10-24
+
+### Governance & Operational Alignment
+- **Cadence & Sidecar Audit Policy (`SKILL.md`, `AGENTS.md`)**:
+  - Evaluated against `scheduled-task-rescheduler § Anti-Fragmentation & SaaS Tracking Invariant` and `wheel-check § Reuse Ladder`.
+  - Formally codified the **Zero-Isolated-Sidecar Invariant**: skipped creating standalone single-SaaS background daemons for Social Blade alone to prevent snippet rot and ghost logic. Reusable background polling is achieved via native `socialblade watch` or integration into cross-platform growth cadences (`CAD-20261023-portfolio-traffic-signal-journey-report` / `daily-intel-radar`).
+- **Owner Surface Triad & Choosing the Rung**:
+  - Hardened Twitter discontinuation and Business API 401 handling across Rung 1 (Code Tier 3 bridge) and Rung 2 (`SKILL.md § Gotchas & API Boundaries`).
+  - Registered canonical tool memory pointer in central Memory Center (`05 - Memory Center/tools/socialblade-cli.md`).
+
 ## [1.2.0] - 2026-10-24
 
 ### Added
