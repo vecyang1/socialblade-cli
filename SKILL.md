@@ -54,6 +54,17 @@ socialblade favorites --platform youtube
 socialblade ledger list
 socialblade ledger history youtube:@vecyang --days 30
 socialblade ledger history twitter:@HTX_Studio --json
+
+# 7. Historical post engagement stream & unified daily delta + post timeline
+socialblade posts youtube @vecyang --limit 5
+socialblade posts twitter @HTX_Studio --limit 5
+socialblade timeline youtube @vecyang --days 14
+socialblade timeline twitter @HTX_Studio --days 14 --post-limit 5
+
+# 8. 5-year Holt's Linear future projections, creator search & watch loop
+socialblade projections youtube @vecyang
+socialblade search vecyang --platform youtube
+socialblade watch youtube:@vecyang --iterations 1 --tier bridge
 ```
 
 ## Verification Commands

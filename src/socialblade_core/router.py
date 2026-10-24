@@ -588,3 +588,49 @@ def select_tier_plan(
         "can_execute": len(chain) > 0,
         "rationale": " ".join(reasons) if reasons else f"No eligible provider available ({browser_reason}).",
     }
+
+
+def select_posts_plan(
+    target: ParsedTarget,
+    config: SocialBladeConfig,
+) -> dict[str, Any]:
+    """Determine the execution plan for historical post/video/tweet engagement retrieval."""
+    if target.platform == "youtube":
+        has_yt = bool(config.yt_data_bin.value)
+        return {
+            "platform": "youtube",
+            "primary_provider": "yt_data_channel" if has_yt else "sqlite_ssot",
+            "can_execute": has_yt,
+            "rationale": (
+                "Social Blade gates youtube.videos behind authenticated accounts (HTTP 401 UNAUTHORIZED); "
+                "bridges to yt-data channel stream + local SQLite creator_posts SSOT with derived engagement_rate."
+                if has_yt
+                else "yt-data binary not found on PATH; falls back to cached creator_posts in SQLite SSOT."
+            ),
+        }
+    if target.platform == "twitter":
+        has_th = bool(config.tikhub_api_key.value or config.tikhub_twitter_bin.value)
+        return {
+            "platform": "twitter",
+            "primary_provider": (
+                "tikhub_http_tweets"
+                if config.tikhub_api_key.value
+                else ("tikhub_cli_tweets" if config.tikhub_twitter_bin.value else "sqlite_ssot")
+            ),
+            "can_execute": has_th,
+            "rationale": (
+                "Social Blade discontinued Twitter/X globally; bridges to TikHub user tweets API/CLI "
+                "+ local SQLite creator_posts SSOT with derived engagement_rate."
+                if has_th
+                else "Neither TIKHUB_API_KEY nor tikhub-twitter found; falls back to cached creator_posts in SQLite SSOT."
+            ),
+        }
+    return {
+        "platform": target.platform,
+        "primary_provider": "sqlite_ssot",
+        "can_execute": True,
+        "rationale": (
+            f"Social Blade does not expose public per-post engagement streams for '{target.platform}'; "
+            "queries local SQLite creator_posts SSOT if previously ingested."
+        ),
+    }

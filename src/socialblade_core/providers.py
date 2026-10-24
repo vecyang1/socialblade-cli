@@ -25,12 +25,14 @@ import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .browser import (
     BrowserError,
     FAVORITES_FN_JS,
+    PROJECTION_FN_JS,
+    SEARCH_FN_JS,
     STATS_FN_JS,
     evaluate_on_socialblade,
 )
@@ -39,15 +41,25 @@ from .ledger import (
     SnapshotLedger,
     build_completeness_receipt,
     derive_daily_deltas,
+    derive_posts_engagement,
+    derive_timeline_entries,
     enrich_growth_from_daily,
 )
 from .router import select_tier_plan
 from .types import (
+    SOCIALBLADE_NATIVE_PLATFORMS,
+    CreatorProjectionReport,
     CreatorStatsReport,
+    CreatorTimelineReport,
     DailyPoint,
     GrowthSummary,
+    MilestoneCrossing,
     MonthlyPoint,
     ParsedTarget,
+    PostPoint,
+    ProjectionPoint,
+    SearchCandidate,
+    SearchReport,
     normalize_date_str,
     sanitize_created_at,
     to_optional_float,
@@ -995,3 +1007,896 @@ def execute_stats_flow(
         report.growth = enrich_growth_from_daily(report.daily, report.growth)
 
     return report
+
+
+def _fetch_tikhub_twitter_tweets_http(
+    screen_name: str,
+    config: SocialBladeConfig,
+) -> dict[str, Any]:
+    """Direct HTTP client for TikHub Twitter user tweets when TIKHUB_API_KEY is configured."""
+    base_url = str(
+        config.tikhub_twitter_base_url.value
+        or "https://api.tikhub.io/api/v1/twitter/web"
+    ).rstrip("/")
+    query = urllib.parse.urlencode({"screen_name": screen_name.lstrip("@")})
+    url = f"{base_url}/fetch_user_post_tweet?{query}"
+    headers = {
+        "Authorization": f"Bearer {config.tikhub_api_key.value}",
+        "Accept": "application/json",
+        "User-Agent": "socialblade-cli/1.2",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    timeout_sec = max(12.0, float(config.timeout_ms.value) / 1000.0)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise ProviderError(
+            f"TikHub Twitter Tweets API HTTP {exc.code}: {exc.reason}",
+            status_code=exc.code,
+            tier="platform_bridge",
+        ) from exc
+    except Exception as exc:
+        raise ProviderError(
+            f"TikHub Twitter Tweets API request failed: {exc}",
+            tier="platform_bridge",
+        ) from exc
+
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    return data if isinstance(data, dict) else {}
+
+
+def fetch_creator_posts(
+    target: ParsedTarget,
+    config: SocialBladeConfig,
+    *,
+    limit: int = 20,
+    known_canonical_id: str | None = None,
+) -> tuple[str, str, str | None, list[PostPoint], str]:
+    """Fetch recent posts/videos/tweets with engagement metrics for YouTube or Twitter/X.
+
+    Returns:
+        (canonical_id, display_name, handle, posts, data_source)
+    """
+    safe_limit = max(1, int(limit))
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    if target.platform == "youtube":
+        yt_bin = str(config.yt_data_bin.value or "")
+        if not yt_bin:
+            raise ProviderError(
+                "yt-data CLI is not available on PATH for YouTube video engagement extraction.",
+                tier="platform_bridge",
+            )
+        if target.identifier_type == "channel_id":
+            channel_url = f"https://www.youtube.com/channel/{target.identifier}/videos"
+        else:
+            channel_url = f"https://www.youtube.com/@{target.identifier.lstrip('@')}/videos"
+
+        try:
+            proc = subprocess.run(
+                [yt_bin, "channel", channel_url, "--limit", str(safe_limit), "--json"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except Exception as exc:
+            raise ProviderError(
+                f"yt-data channel execution failed: {exc}",
+                tier="platform_bridge",
+            ) from exc
+
+        if proc.returncode != 0:
+            raise ProviderError(
+                f"yt-data channel exited with {proc.returncode}: {(proc.stderr or proc.stdout).strip()[:250]}",
+                status_code=404,
+                tier="platform_bridge",
+            )
+
+        stdout_str = (proc.stdout or "").strip()
+        videos: list[Any] | None = None
+        decoder = json.JSONDecoder()
+        for idx, ch_char in enumerate(stdout_str):
+            if ch_char == "[" and (idx == 0 or stdout_str[idx - 1] in ("\n", "\r")):
+                try:
+                    candidate, _ = decoder.raw_decode(stdout_str, idx)
+                    if isinstance(candidate, list) and all(isinstance(x, dict) for x in candidate):
+                        videos = candidate
+                        break
+                except Exception:
+                    continue
+        if videos is None:
+            try:
+                parsed_any = json.loads(stdout_str)
+                videos = parsed_any if isinstance(parsed_any, list) else []
+            except Exception as exc:
+                raise ProviderError(
+                    f"Failed to parse JSON video list from yt-data: {exc}",
+                    tier="platform_bridge",
+                ) from exc
+
+        channel_id = ""
+        display_name = target.identifier
+        for v in videos:
+            if isinstance(v, dict) and v.get("channel_id"):
+                channel_id = str(v["channel_id"]).strip()
+            if isinstance(v, dict) and v.get("channel_name"):
+                display_name = str(v["channel_name"]).strip()
+            if channel_id:
+                break
+
+        if not channel_id:
+            if known_canonical_id and ":" in known_canonical_id:
+                channel_id = known_canonical_id.split(":", 1)[1]
+            else:
+                channel_id = target.identifier
+
+        canonical_id = f"youtube:{channel_id}"
+        handle = (
+            f"@{target.identifier.lstrip('@')}"
+            if target.identifier_type != "channel_id"
+            else None
+        )
+        posts_source = "yt_data"
+        posts: list[PostPoint] = []
+        for v in videos[:safe_limit]:
+            if not isinstance(v, dict):
+                continue
+            vid = str(v.get("video_id") or "").strip()
+            if not vid:
+                continue
+            pub_date = normalize_date_str(v.get("published_date")) or today_str
+            dur_sec = to_optional_int(v.get("duration_seconds"))
+            p_type = "short" if (dur_sec is not None and 0 < dur_sec <= 60) else "video"
+            src = str(v.get("data_source") or "yt_data")
+            posts_source = src
+            posts.append(
+                PostPoint(
+                    post_uid=f"youtube:{vid}",
+                    canonical_id=canonical_id,
+                    platform="youtube",
+                    post_id=vid,
+                    published_date=pub_date,
+                    published_at=pub_date,
+                    title=str(v.get("title") or "").strip(),
+                    url=str(v.get("url") or f"https://www.youtube.com/watch?v={vid}"),
+                    post_type=p_type,
+                    views=to_optional_int(v.get("views")),
+                    likes=to_optional_int(v.get("likes")),
+                    comments=to_optional_int(v.get("comments")),
+                    shares=None,
+                    bookmarks=None,
+                    duration=str(v.get("duration") or "") or None,
+                    source=src,
+                )
+            )
+        return canonical_id, display_name, handle, posts, posts_source
+
+    if target.platform == "twitter":
+        data: dict[str, Any] | None = None
+        tikhub_bin = str(config.tikhub_twitter_bin.value or "")
+        if config.tikhub_api_key.value:
+            try:
+                data = _fetch_tikhub_twitter_tweets_http(target.identifier, config)
+            except ProviderError:
+                if not tikhub_bin:
+                    raise
+
+        if data is None:
+            if not tikhub_bin:
+                raise ProviderError(
+                    "Neither TIKHUB_API_KEY nor tikhub-twitter CLI is configured for Twitter/X post retrieval.",
+                    tier="platform_bridge",
+                )
+            try:
+                proc = subprocess.run(
+                    [tikhub_bin, "tweets", target.identifier, "--json"],
+                    capture_output=True,
+                    text=True,
+                    timeout=35,
+                )
+            except Exception as exc:
+                raise ProviderError(
+                    f"tikhub-twitter tweets execution failed: {exc}",
+                    tier="platform_bridge",
+                ) from exc
+
+            if proc.returncode != 0:
+                raise ProviderError(
+                    f"tikhub-twitter tweets exited with {proc.returncode}: {(proc.stderr or proc.stdout).strip()[:250]}",
+                    tier="platform_bridge",
+                )
+            try:
+                data = json.loads(proc.stdout)
+            except Exception as exc:
+                raise ProviderError(
+                    f"Invalid JSON from tikhub-twitter tweets: {exc}",
+                    tier="platform_bridge",
+                ) from exc
+
+        user_obj = data.get("user") if isinstance(data.get("user"), dict) else {}
+        timeline = (
+            data.get("timeline")
+            if isinstance(data.get("timeline"), list)
+            else (data.get("tweets") if isinstance(data.get("tweets"), list) else [])
+        )
+        first_author = (
+            timeline[0].get("author")
+            if (timeline and isinstance(timeline[0], dict) and isinstance(timeline[0].get("author"), dict))
+            else {}
+        )
+        rest_id = str(
+            user_obj.get("rest_id")
+            or user_obj.get("id")
+            or first_author.get("rest_id")
+            or first_author.get("id")
+            or ""
+        ).strip()
+        if not rest_id and known_canonical_id and known_canonical_id.startswith("twitter:"):
+            rest_id = known_canonical_id.split(":", 1)[1]
+        if not rest_id:
+            prof = fetch_platform_bridge(target, config, days=1)
+            rest_id = prof.platform_id
+
+        username = str(
+            user_obj.get("screen_name")
+            or first_author.get("screen_name")
+            or target.identifier.lstrip("@")
+        ).strip()
+        display_name = str(
+            user_obj.get("name")
+            or first_author.get("name")
+            or username
+        ).strip()
+        canonical_id = f"twitter:{rest_id}"
+        handle = f"@{username}"
+
+        posts = []
+        for item in timeline[:safe_limit]:
+            if not isinstance(item, dict):
+                continue
+            tid = str(item.get("tweet_id") or item.get("id") or "").strip()
+            if not tid:
+                continue
+            raw_created = str(item.get("created_at") or "").strip()
+            pub_date = normalize_date_str(raw_created) or today_str
+            text_clean = " ".join(str(item.get("text") or item.get("full_text") or "").split())
+            posts.append(
+                PostPoint(
+                    post_uid=f"twitter:{tid}",
+                    canonical_id=canonical_id,
+                    platform="twitter",
+                    post_id=tid,
+                    published_date=pub_date,
+                    published_at=raw_created or pub_date,
+                    title=text_clean[:140],
+                    url=f"https://x.com/{username}/status/{tid}",
+                    post_type="tweet",
+                    views=to_optional_int(item.get("views")),
+                    likes=to_optional_int(
+                        item.get("favorites")
+                        if item.get("favorites") is not None
+                        else item.get("favorite_count")
+                    ),
+                    comments=to_optional_int(
+                        item.get("replies")
+                        if item.get("replies") is not None
+                        else item.get("reply_count")
+                    ),
+                    shares=to_optional_int(
+                        item.get("retweets")
+                        if item.get("retweets") is not None
+                        else item.get("retweet_count")
+                    ),
+                    bookmarks=to_optional_int(
+                        item.get("bookmarks")
+                        if item.get("bookmarks") is not None
+                        else item.get("bookmark_count")
+                    ),
+                    duration=None,
+                    source="tikhub_twitter",
+                )
+            )
+        return canonical_id, display_name, handle, posts, "tikhub_twitter"
+
+    raise ProviderError(
+        f"Live post engagement stream is supported for YouTube (yt-data) and Twitter/X (TikHub); "
+        f"platform '{target.platform}' does not expose public per-post history on Social Blade.",
+        status_code=400,
+        tier="platform_bridge",
+    )
+
+
+def execute_posts_flow(
+    target: ParsedTarget,
+    config: SocialBladeConfig,
+    ledger: SnapshotLedger,
+    *,
+    limit: int = 20,
+    persist: bool = True,
+    known_canonical_id: str | None = None,
+) -> dict[str, Any]:
+    """Fetch, persist (Read-After-Write), and summarize historical creator posts."""
+    safe_limit = max(1, int(limit))
+    resolved_cid = known_canonical_id or ledger.resolve_canonical_id(target.platform, target.identifier)
+
+    try:
+        canonical_id, display_name, handle, raw_posts, posts_source = fetch_creator_posts(
+            target,
+            config,
+            limit=safe_limit,
+            known_canonical_id=resolved_cid,
+        )
+        if persist and raw_posts:
+            verified_posts = ledger.upsert_posts(
+                canonical_id,
+                target.platform,
+                raw_posts,
+                display_name=display_name,
+                username=target.identifier.lstrip("@"),
+                handle=handle,
+                extra_aliases=[target.identifier],
+                limit=safe_limit,
+            )
+            ledger_verified = len(verified_posts) > 0
+        else:
+            verified_posts = derive_posts_engagement(raw_posts)[:safe_limit]
+            ledger_verified = False
+    except ProviderError:
+        if resolved_cid:
+            cached = ledger.get_creator_posts(resolved_cid, limit=safe_limit)
+            if cached:
+                meta = ledger.get_creator_summary(resolved_cid) or {}
+                canonical_id = resolved_cid
+                display_name = str(meta.get("display_name") or target.identifier)
+                handle = meta.get("handle")
+                verified_posts = cached
+                posts_source = "sqlite_ssot_cache"
+                ledger_verified = True
+            else:
+                raise
+        else:
+            raise
+
+    _, summary = derive_timeline_entries([], verified_posts)
+    completeness = build_completeness_receipt(
+        requested_days=safe_limit,
+        returned_days=len(verified_posts),
+        platform=target.platform,
+        data_source=posts_source,
+        pagination_verified=True,
+        reason_override=(
+            f"Returned {len(verified_posts)}/{safe_limit} requested posts from {posts_source}."
+            if len(verified_posts) < safe_limit
+            else None
+        ),
+    )
+    platform_id = canonical_id.split(":", 1)[1] if ":" in canonical_id else canonical_id
+    return {
+        "canonical_id": canonical_id,
+        "platform": target.platform,
+        "platform_id": platform_id,
+        "username": target.identifier.lstrip("@"),
+        "display_name": display_name,
+        "handle": handle,
+        "data_source": posts_source,
+        "ledger_verified": ledger_verified,
+        "completeness": completeness.as_dict(),
+        "engagement_summary": summary,
+        "posts": [p.as_dict() for p in verified_posts],
+        "_post_objects": verified_posts,
+    }
+
+
+def execute_timeline_flow(
+    target: ParsedTarget,
+    config: SocialBladeConfig,
+    ledger: SnapshotLedger,
+    *,
+    days: int = 30,
+    post_limit: int = 20,
+    requested_tier: str = "auto",
+    persist: bool = True,
+) -> CreatorTimelineReport:
+    """Execute unified daily follower/view delta + post engagement timeline reconciliation."""
+    stats_rep = execute_stats_flow(
+        target,
+        config,
+        ledger,
+        days=days,
+        include_monthly=False,
+        requested_tier=requested_tier,
+        persist=persist,
+    )
+
+    posts_list: list[PostPoint] = []
+    posts_source = "none"
+    try:
+        posts_res = execute_posts_flow(
+            target,
+            config,
+            ledger,
+            limit=post_limit,
+            persist=persist,
+            known_canonical_id=stats_rep.canonical_id,
+        )
+        posts_list = posts_res.get("_post_objects") or []
+        posts_source = str(posts_res.get("data_source") or "unknown")
+    except ProviderError as exc:
+        posts_source = f"unavailable ({exc})"
+
+    timeline_entries, eng_summary = derive_timeline_entries(stats_rep.daily, posts_list)
+    posts_completeness = build_completeness_receipt(
+        requested_days=post_limit,
+        returned_days=len(posts_list),
+        platform=target.platform,
+        data_source=posts_source,
+        pagination_verified=True,
+        reason_override=(
+            f"Returned {len(posts_list)}/{post_limit} requested posts ({posts_source})."
+            if len(posts_list) < post_limit
+            else None
+        ),
+    )
+
+    return CreatorTimelineReport(
+        canonical_id=stats_rep.canonical_id,
+        platform=stats_rep.platform,
+        platform_id=stats_rep.platform_id,
+        username=stats_rep.username,
+        display_name=stats_rep.display_name,
+        handle=stats_rep.handle,
+        stats_source=stats_rep.data_source,
+        posts_source=posts_source,
+        ledger_verified=bool(stats_rep.ledger_verified),
+        completeness=stats_rep.completeness,
+        posts_completeness=posts_completeness,
+        engagement_summary=eng_summary,
+        timeline=timeline_entries,
+        posts=posts_list,
+    )
+
+
+def _compute_milestone_crossings(
+    current_val: int | None,
+    series: list[ProjectionPoint],
+    metric: str,
+) -> list[MilestoneCrossing]:
+    """Identify future dates when a creator crosses round follower or view milestones."""
+    if current_val is None or current_val < 0 or not series:
+        return []
+
+    standard_milestones = [
+        100,
+        250,
+        500,
+        1_000,
+        2_500,
+        5_000,
+        10_000,
+        25_000,
+        50_000,
+        100_000,
+        250_000,
+        500_000,
+        1_000_000,
+        2_500_000,
+        5_000_000,
+        10_000_000,
+        25_000_000,
+        50_000_000,
+        100_000_000,
+        250_000_000,
+        500_000_000,
+        1_000_000_000,
+        2_500_000_000,
+        5_000_000_000,
+        10_000_000_000,
+    ]
+    # Also add the immediate next round step above current_val
+    if current_val < 1_000:
+        step = 100
+    elif current_val < 10_000:
+        step = 500
+    elif current_val < 100_000:
+        step = 10_000
+    elif current_val < 1_000_000:
+        step = 100_000
+    elif current_val < 10_000_000:
+        step = 1_000_000
+    else:
+        step = 10_000_000
+    next_step = ((current_val // step) + 1) * step
+    candidates = sorted({m for m in (standard_milestones + [next_step]) if m > current_val})
+
+    crossings: list[MilestoneCrossing] = []
+    for m in candidates:
+        for pt in series:
+            val = pt.followers if metric == "followers" else pt.views
+            if val is not None and val >= m:
+                crossings.append(
+                    MilestoneCrossing(
+                        metric=metric,
+                        milestone=m,
+                        projected_date=pt.date,
+                        days_until=pt.horizon_days,
+                    )
+                )
+                break
+        if len(crossings) >= 5:
+            break
+    return crossings
+
+
+def execute_projections_flow(
+    target: ParsedTarget,
+    config: SocialBladeConfig,
+    ledger: SnapshotLedger,
+    *,
+    max_days: int = 1826,
+    requested_tier: str = "auto",
+) -> CreatorProjectionReport:
+    """Fetch 5-year (1,826-day) Holt's Linear future projections from Social Blade tRPC or derive linear velocity forecast."""
+    safe_max_days = max(1, min(1826, int(max_days)))
+    horizon_Marks = {7, 14, 30, 60, 90, 180, 365, 730, 1095, 1460, 1825, safe_max_days}
+
+    if (
+        target.platform in SOCIALBLADE_NATIVE_PLATFORMS
+        and target.web_path
+        and requested_tier in ("auto", "ego", "web")
+    ):
+        try:
+            raw_res, _ = evaluate_on_socialblade(
+                PROJECTION_FN_JS,
+                {
+                    "webPath": target.web_path,
+                    "platform": target.platform,
+                    "timeoutMs": int(config.timeout_ms.value or 12000),
+                },
+                config,
+            )
+            if raw_res.get("ok") and raw_res.get("projectionRows"):
+                u = raw_res.get("userData") or {}
+                platform_id = str(u.get("id") or target.identifier).strip()
+                username = str(
+                    u.get("username")
+                    or (u.get("identifier") or {}).get("identifier")
+                    or target.identifier
+                ).strip()
+                display_name = str(u.get("displayName") or username).strip()
+                handle = (
+                    f"@{u['identifier']['identifier']}"
+                    if isinstance(u.get("identifier"), dict) and u["identifier"].get("identifier")
+                    else (f"@{username}" if username else None)
+                )
+                stats_block = u.get("stats") or u
+                curr_fol = to_optional_int(
+                    stats_block.get("subscribers")
+                    if "subscribers" in stats_block
+                    else (
+                        stats_block.get("followers")
+                        if "followers" in stats_block
+                        else stats_block.get("likes")
+                    )
+                )
+                curr_views = to_optional_int(
+                    stats_block.get("views")
+                    if "views" in stats_block
+                    else (
+                        stats_block.get("talkingAbout")
+                        if "talkingAbout" in stats_block
+                        else (stats_block.get("likes") if target.platform == "tiktok" else None)
+                    )
+                )
+
+                proj_rows = raw_res.get("projectionRows") or []
+                series: list[ProjectionPoint] = []
+                for idx, r in enumerate(proj_rows[:safe_max_days]):
+                    d_str = normalize_date_str(r.get("date"))
+                    if not d_str:
+                        continue
+                    p_fol = to_optional_int(
+                        r.get("subscribers")
+                        if "subscribers" in r
+                        else (r.get("followers") if "followers" in r else r.get("likes"))
+                    )
+                    p_vw = to_optional_int(
+                        r.get("views")
+                        if "views" in r
+                        else (
+                            r.get("talking_about")
+                            if "talking_about" in r
+                            else (r.get("likes") if target.platform == "tiktok" else None)
+                        )
+                    )
+                    series.append(
+                        ProjectionPoint(
+                            date=d_str,
+                            horizon_days=idx + 1,
+                            followers=p_fol,
+                            views=p_vw,
+                            gained_followers=(
+                                (p_fol - curr_fol)
+                                if (p_fol is not None and curr_fol is not None)
+                                else None
+                            ),
+                            gained_views=(
+                                (p_vw - curr_views)
+                                if (p_vw is not None and curr_views is not None)
+                                else None
+                            ),
+                        )
+                    )
+
+                horizons = [pt for pt in series if pt.horizon_days in horizon_Marks]
+                milestones = _compute_milestone_crossings(
+                    curr_fol, series, "followers"
+                ) + _compute_milestone_crossings(curr_views, series, "views")
+
+                return CreatorProjectionReport(
+                    canonical_id=f"{target.platform}:{platform_id}",
+                    platform=target.platform,
+                    platform_id=platform_id,
+                    username=username,
+                    display_name=display_name,
+                    handle=handle,
+                    current_followers=curr_fol,
+                    current_views=curr_views,
+                    method="socialblade_holts_linear",
+                    total_projected_days=len(series),
+                    horizons=horizons,
+                    milestones=milestones,
+                    series=series,
+                    data_source="ego_trpc_projection",
+                )
+        except Exception:
+            if requested_tier in ("ego", "web"):
+                raise
+
+    # Fallback: velocity-based linear projection derived from stats_flow
+    stats_rep = execute_stats_flow(
+        target,
+        config,
+        ledger,
+        days=30,
+        include_monthly=False,
+        requested_tier=requested_tier,
+        persist=True,
+    )
+    curr_fol = to_optional_int(stats_rep.totals.get("followers"))
+    curr_views = to_optional_int(
+        stats_rep.totals.get("views")
+        if stats_rep.platform != "tiktok"
+        else stats_rep.totals.get("likes")
+    )
+    fol_vel = float(stats_rep.growth.daily_avg_followers or 0.0)
+    view_vel = float(stats_rep.growth.daily_avg_views or 0.0)
+
+    base_dt = datetime.now(timezone.utc).date()
+    series = []
+    for h in range(1, safe_max_days + 1):
+        d_str = (base_dt + timedelta(days=h)).strftime("%Y-%m-%d")
+        p_fol = int(round(curr_fol + fol_vel * h)) if curr_fol is not None else None
+        p_vw = int(round(curr_views + view_vel * h)) if curr_views is not None else None
+        series.append(
+            ProjectionPoint(
+                date=d_str,
+                horizon_days=h,
+                followers=p_fol,
+                views=p_vw,
+                gained_followers=(p_fol - curr_fol) if (p_fol is not None and curr_fol is not None) else None,
+                gained_views=(p_vw - curr_views) if (p_vw is not None and curr_views is not None) else None,
+            )
+        )
+
+    horizons = [pt for pt in series if pt.horizon_days in horizon_Marks]
+    milestones = _compute_milestone_crossings(
+        curr_fol, series, "followers"
+    ) + _compute_milestone_crossings(curr_views, series, "views")
+
+    return CreatorProjectionReport(
+        canonical_id=stats_rep.canonical_id,
+        platform=stats_rep.platform,
+        platform_id=stats_rep.platform_id,
+        username=stats_rep.username,
+        display_name=stats_rep.display_name,
+        handle=stats_rep.handle,
+        current_followers=curr_fol,
+        current_views=curr_views,
+        method="velocity_linear",
+        total_projected_days=len(series),
+        horizons=horizons,
+        milestones=milestones,
+        series=series,
+        data_source=f"{stats_rep.data_source}+velocity_projection",
+    )
+
+
+def execute_search_flow(
+    query: str,
+    config: SocialBladeConfig,
+    *,
+    platform: str = "youtube",
+    limit: int = 10,
+) -> SearchReport:
+    """Search creators on Social Blade tRPC (`{platform}.search`) or platform bridges."""
+    q_clean = (query or "").strip()
+    if not q_clean:
+        raise ProviderError("Search query cannot be empty.", status_code=400, tier="search")
+    safe_limit = max(1, int(limit))
+    plat = platform.lower()
+
+    if plat in SOCIALBLADE_NATIVE_PLATFORMS:
+        try:
+            raw_res, _ = evaluate_on_socialblade(
+                SEARCH_FN_JS,
+                {
+                    "platform": plat,
+                    "query": q_clean,
+                    "timeoutMs": int(config.timeout_ms.value or 12000),
+                },
+                config,
+            )
+        except BrowserError as exc:
+            raise ProviderError(str(exc), status_code=exc.status_code, tier="ego_trpc") from exc
+
+        if not raw_res.get("ok"):
+            raise ProviderError(
+                str(raw_res.get("error") or "Social Blade search failed"),
+                status_code=to_optional_int(raw_res.get("status")) or 500,
+                tier="ego_trpc",
+            )
+
+        raw_items: list[dict[str, Any]] = []
+        p_res = raw_res.get("platformResult")
+        if isinstance(p_res, dict) and p_res.get("id"):
+            raw_items.append(p_res)
+        for item in raw_res.get("results") or []:
+            if isinstance(item, dict) and item.get("id"):
+                raw_items.append(item)
+
+        seen_ids: set[str] = set()
+        candidates: list[SearchCandidate] = []
+        for item in raw_items:
+            cid = str(item.get("id") or "").strip()
+            if not cid or cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            uname = str(
+                item.get("username")
+                or item.get("handle")
+                or item.get("cusername")
+                or cid
+            ).strip()
+            dname = str(item.get("displayName") or uname).strip()
+            handle_val = item.get("handle") or item.get("username")
+            handle = f"@{str(handle_val).lstrip('@')}" if handle_val else None
+            fol = to_optional_int(
+                item.get("subscribers")
+                if "subscribers" in item
+                else (item.get("followers") if "followers" in item else item.get("likes"))
+            )
+            vw = to_optional_int(
+                item.get("views")
+                if "views" in item
+                else (
+                    item.get("talking_about")
+                    if "talking_about" in item
+                    else (item.get("likes") if plat == "tiktok" else None)
+                )
+            )
+            pst = to_optional_int(
+                item.get("videos")
+                if "videos" in item
+                else (item.get("media") if "media" in item else item.get("uploads"))
+            )
+            candidates.append(
+                SearchCandidate(
+                    platform=plat,
+                    platform_id=cid,
+                    canonical_id=f"{plat}:{cid}",
+                    username=uname,
+                    display_name=dname,
+                    handle=handle,
+                    followers=fol,
+                    views=vw,
+                    posts=pst,
+                    verified=bool(item["verified"]) if "verified" in item and item["verified"] is not None else None,
+                    source="ego_trpc_search",
+                )
+            )
+            if len(candidates) >= safe_limit:
+                break
+
+        return SearchReport(
+            query=q_clean,
+            platform=plat,
+            count=len(candidates),
+            candidates=candidates,
+            data_source="ego_trpc_search",
+        )
+
+    if plat == "twitter":
+        candidates = []
+        seen_ids = set()
+        # 1. If query looks like a handle, try direct profile resolution first
+        clean_handle = q_clean.lstrip("@").strip()
+        if " " not in clean_handle:
+            try:
+                from .router import parse_target
+
+                prof_rep = fetch_platform_bridge(
+                    parse_target(clean_handle, explicit_platform="twitter"),
+                    config,
+                    days=1,
+                )
+                seen_ids.add(prof_rep.platform_id)
+                candidates.append(
+                    SearchCandidate(
+                        platform="twitter",
+                        platform_id=prof_rep.platform_id,
+                        canonical_id=prof_rep.canonical_id,
+                        username=prof_rep.username,
+                        display_name=prof_rep.display_name,
+                        handle=prof_rep.handle,
+                        followers=to_optional_int(prof_rep.totals.get("followers")),
+                        views=None,
+                        posts=to_optional_int(prof_rep.totals.get("posts")),
+                        verified=None,
+                        source="tikhub_twitter",
+                    )
+                )
+            except Exception:
+                pass
+
+        # 2. Search timeline via tikhub-twitter to discover matching creators
+        tikhub_bin = str(config.tikhub_twitter_bin.value or "")
+        if tikhub_bin and len(candidates) < safe_limit:
+            try:
+                proc = subprocess.run(
+                    [tikhub_bin, "search", q_clean, "--json"],
+                    capture_output=True,
+                    text=True,
+                    timeout=25,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    s_data = json.loads(proc.stdout)
+                    tl = s_data.get("timeline") if isinstance(s_data, dict) else []
+                    for item in tl or []:
+                        auth = item.get("author") if isinstance(item, dict) else None
+                        if not isinstance(auth, dict):
+                            continue
+                        rid = str(auth.get("rest_id") or auth.get("id") or "").strip()
+                        if not rid or rid in seen_ids:
+                            continue
+                        seen_ids.add(rid)
+                        sn = str(auth.get("screen_name") or rid).strip()
+                        candidates.append(
+                            SearchCandidate(
+                                platform="twitter",
+                                platform_id=rid,
+                                canonical_id=f"twitter:{rid}",
+                                username=sn,
+                                display_name=str(auth.get("name") or sn).strip(),
+                                handle=f"@{sn}",
+                                followers=to_optional_int(auth.get("sub_count") or auth.get("followers_count")),
+                                views=None,
+                                posts=to_optional_int(auth.get("statuses_count")),
+                                verified=bool(auth.get("blue_verified")) if "blue_verified" in auth else None,
+                                source="tikhub_twitter_search",
+                            )
+                        )
+                        if len(candidates) >= safe_limit:
+                            break
+            except Exception:
+                pass
+
+        return SearchReport(
+            query=q_clean,
+            platform="twitter",
+            count=len(candidates),
+            candidates=candidates,
+            data_source="tikhub_twitter",
+        )
+
+    raise ProviderError(f"Unsupported search platform '{platform}'.", status_code=400, tier="search")

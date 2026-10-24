@@ -160,6 +160,104 @@ async (plat) => {
 }
 """
 
+PROJECTION_FN_JS = r"""
+async (p) => {
+  async function fetchTextWithTimeout(url, ms) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms);
+    try {
+      const res = await fetch(url, { signal: ctrl.signal });
+      const text = await res.text();
+      return { ok: true, status: res.status, text };
+    } catch (err) {
+      return { ok: false, status: 0, error: String(err) };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  const htmlResp = await fetchTextWithTimeout(p.webPath, p.timeoutMs);
+  if (!htmlResp.ok) {
+    return { ok: false, status: 0, error: htmlResp.error || "Fetch failed" };
+  }
+  if (htmlResp.status === 404) {
+    return { ok: false, status: 404, error: "Creator not found on Social Blade (HTTP 404)" };
+  }
+  if (htmlResp.status === 403) {
+    return { ok: false, status: 403, error: "Blocked by Cloudflare challenge (HTTP 403)." };
+  }
+  const match = htmlResp.text.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+  if (!match) {
+    return { ok: false, status: htmlResp.status, error: "Missing __NEXT_DATA__ on Social Blade response" };
+  }
+
+  const nextData = JSON.parse(match[1]);
+  const queries = nextData?.props?.pageProps?.trpcState?.json?.queries || [];
+  const userQ = queries.find(q => q.queryKey?.[0]?.[0] === p.platform && q.queryKey?.[0]?.[1] === "user");
+  const userData = userQ?.state?.data;
+  if (!userData || !userData.id) {
+    return { ok: false, status: 404, error: "Creator record not found in Social Blade __NEXT_DATA__" };
+  }
+
+  const creatorId = String(userData.id);
+  const input = { "0": { "json": { "id": creatorId } } };
+  const trpcUrl = `/api/trpc/${p.platform}.projection?batch=1&input=${encodeURIComponent(JSON.stringify(input))}`;
+  const trpcResp = await fetchTextWithTimeout(trpcUrl, p.timeoutMs);
+  if (!trpcResp.ok) {
+    return { ok: false, status: trpcResp.status || 500, error: trpcResp.error || "tRPC projection request failed" };
+  }
+  let parsed = null;
+  try {
+    parsed = JSON.parse(trpcResp.text);
+  } catch (e) {
+    return { ok: false, status: trpcResp.status, error: "Invalid JSON from tRPC projection endpoint" };
+  }
+  const err = parsed?.[0]?.error?.json;
+  if (err) {
+    return { ok: false, status: err.data?.httpStatus || trpcResp.status || 400, error: err.message || "Projection error" };
+  }
+  const projRows = parsed?.[0]?.result?.data?.json?.projection || [];
+  return {
+    ok: true,
+    status: 200,
+    userData,
+    projectionRows: Array.isArray(projRows) ? projRows : []
+  };
+}
+"""
+
+SEARCH_FN_JS = r"""
+async (p) => {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), p.timeoutMs || 12000);
+  try {
+    const input = { "0": { "json": { "query": p.query } } };
+    const url = `/api/trpc/${p.platform}.search?batch=1&input=${encodeURIComponent(JSON.stringify(input))}`;
+    const res = await fetch(url, { signal: ctrl.signal });
+    const text = await res.text();
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch (e) {
+      return { ok: false, status: res.status, error: "Non-JSON search response (HTTP " + res.status + ")" };
+    }
+    const err = parsed?.[0]?.error?.json;
+    if (err) {
+      return { ok: false, status: err.data?.httpStatus || res.status || 400, error: err.message || "Search failed" };
+    }
+    const data = parsed?.[0]?.result?.data?.json || {};
+    return {
+      ok: true,
+      status: res.status,
+      platformResult: data.platformResult || null,
+      results: Array.isArray(data.results) ? data.results : []
+    };
+  } catch (err) {
+    return { ok: false, status: 0, error: String(err) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+"""
+
 
 # ---------------------------------------------------------------------------
 # Backend resolution (diagnosable: returns the reason for every decision)

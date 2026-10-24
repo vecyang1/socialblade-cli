@@ -2,6 +2,19 @@
 
 All notable changes to `socialblade-cli` (`socialblade`) are documented in this file.
 
+## [1.2.0] - 2026-10-24
+
+### Added
+- **Creator Post Engagement Stream (`socialblade posts`)**:
+  - Bridges YouTube (`yt-data channel` stream) and Twitter/X (`tikhub` tweets API/CLI) to fetch recent videos/shorts/tweets with views, likes, comments, shares, and bookmarks.
+  - Persists raw post observations in SQLite `creator_posts` (SSOT) and dynamically derives `engagement_rate = (likes + comments + shares) / views * 100` on read after Read-After-Write verification.
+- **Unified Growth + Post Engagement Timeline (`socialblade timeline`)**:
+  - Joins chronological daily follower/view deltas from `daily_snapshots` with published posts from `creator_posts` by date (`YYYY-MM-DD`), surfacing top-performing posts and highest-growth days.
+- **5-Year Future Growth Projections (`socialblade projections`)**:
+  - Extracts 1,826-day Holt's Linear forecasts from Social Blade tRPC (`/api/trpc/{platform}.projection`) or velocity linear projections, plus automated round milestone crossings (`MilestoneCrossing`).
+- **Creator Discovery Search & Watch Loop (`socialblade search`, `socialblade watch`)**:
+  - Added multi-platform creator discovery (`{platform}.search` tRPC + TikHub bridge) and scheduled snapshot/post polling (`watch`) for cron/launchd cadences.
+
 ## [1.1.0] - 2026-10-24
 
 ### Added

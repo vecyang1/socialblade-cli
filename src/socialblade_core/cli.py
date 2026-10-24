@@ -5,14 +5,25 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
+from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from .browser import backend_availability, resolve_backend
 from .config import SocialBladeConfig
-from .ledger import SnapshotLedger, build_completeness_receipt, enrich_growth_from_daily
+from .ledger import (
+    SnapshotLedger,
+    build_completeness_receipt,
+    derive_timeline_entries,
+    enrich_growth_from_daily,
+)
 from .providers import (
     ProviderError,
+    execute_posts_flow,
+    execute_projections_flow,
+    execute_search_flow,
     execute_stats_flow,
+    execute_timeline_flow,
     fetch_ego_favorites,
     fetch_matrix_api,
 )
@@ -21,9 +32,16 @@ from .router import (
     SUPPORTED_PLATFORMS,
     normalize_platform,
     parse_target,
+    select_posts_plan,
     select_tier_plan,
 )
-from .types import CreatorStatsReport, ParsedTarget
+from .types import (
+    CreatorProjectionReport,
+    CreatorStatsReport,
+    CreatorTimelineReport,
+    ParsedTarget,
+    SearchReport,
+)
 
 
 def _fmt_int(val: int | float | None, signed: bool = False) -> str:
@@ -315,6 +333,231 @@ def cmd_favorites(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_posts(args: argparse.Namespace) -> int:
+    config = SocialBladeConfig.resolve(
+        cli_db_path=args.db_path,
+        cli_browser_backend=getattr(args, "browser_backend", None),
+        cli_cdp_url=getattr(args, "cdp_url", None),
+    )
+    try:
+        target = _resolve_positional_target(args.target, explicit_platform=args.platform)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    ledger = SnapshotLedger(config.db_path.value)
+    try:
+        res = execute_posts_flow(
+            target, config, ledger, limit=args.limit, persist=not bool(args.no_save)
+        )
+    except ProviderError as exc:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(exc), "target": target.as_dict()}, indent=2))
+        else:
+            print(f"❌ Error retrieving posts for '{target.raw_input}': {exc}", file=sys.stderr)
+        return 1
+
+    res.pop("_post_objects", None)
+    if args.json:
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0
+
+    eng = res.get("engagement_summary") or {}
+    print(f"🎬 Creator Post Engagement Stream: {res['display_name']} ({res['canonical_id']})")
+    print(f"  • Source: {res['data_source']} | Posts: {len(res['posts'])} | Avg Engagement: {_fmt_int(eng.get('avg_engagement_rate'))}%")
+    print("-" * 92)
+    for p in res["posts"]:
+        er = f"{p['engagement_rate']:.2f}%" if p.get("engagement_rate") is not None else "--"
+        print(
+            f"  {p['published_date']} | {p['post_id']:<19} | Views: {_fmt_int(p.get('views')):>10} | "
+            f"Likes: {_fmt_int(p.get('likes')):>7} | Cmt: {_fmt_int(p.get('comments')):>5} | ER: {er:>6} | {p['title'][:32]}"
+        )
+    print("-" * 92)
+    return 0
+
+
+def cmd_timeline(args: argparse.Namespace) -> int:
+    config = SocialBladeConfig.resolve(
+        cli_db_path=args.db_path,
+        cli_days=args.days,
+        cli_browser_backend=getattr(args, "browser_backend", None),
+        cli_cdp_url=getattr(args, "cdp_url", None),
+    )
+    try:
+        target = _resolve_positional_target(args.target, explicit_platform=args.platform)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    ledger = SnapshotLedger(config.db_path.value)
+    days = int(config.default_days.value)
+    try:
+        rep = execute_timeline_flow(
+            target,
+            config,
+            ledger,
+            days=days,
+            post_limit=args.post_limit,
+            requested_tier=args.tier,
+            persist=not bool(args.no_save),
+        )
+    except ProviderError as exc:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(exc), "target": target.as_dict()}, indent=2))
+        else:
+            print(f"❌ Error building timeline for '{target.raw_input}': {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(rep.as_dict(), ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"🗓️  Unified Growth + Post Engagement Timeline: {rep.display_name} ({rep.canonical_id})")
+    print(f"  • Stats Source: {rep.stats_source} | Posts Source: {rep.posts_source} ({len(rep.posts)} posts)")
+    print("-" * 92)
+    for row in rep.timeline[-15:]:
+        er = f"{row.published_engagement_rate:.2f}%" if row.published_engagement_rate is not None else "--"
+        print(
+            f"  {row.date} | Fol: {_fmt_int(row.followers):>10} (Δ {_fmt_int(row.delta_followers, True):>7}) | "
+            f"Views: {_fmt_int(row.views):>11} (Δ {_fmt_int(row.delta_views, True):>9}) | "
+            f"Published: {row.published_posts_count:>2} (Views: {_fmt_int(row.published_post_views):>9}, ER: {er})"
+        )
+    print("-" * 92)
+    return 0
+
+
+def cmd_projections(args: argparse.Namespace) -> int:
+    config = SocialBladeConfig.resolve(
+        cli_db_path=args.db_path,
+        cli_browser_backend=getattr(args, "browser_backend", None),
+        cli_cdp_url=getattr(args, "cdp_url", None),
+    )
+    try:
+        target = _resolve_positional_target(args.target, explicit_platform=args.platform)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    ledger = SnapshotLedger(config.db_path.value)
+    try:
+        rep = execute_projections_flow(
+            target, config, ledger, max_days=args.max_days, requested_tier=args.tier
+        )
+    except ProviderError as exc:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(exc), "target": target.as_dict()}, indent=2))
+        else:
+            print(f"❌ Error computing projections for '{target.raw_input}': {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        payload = rep.as_dict()
+        if not args.full_series:
+            payload.pop("series", None)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"🔮 Future Growth Projections: {rep.display_name} ({rep.canonical_id})")
+    print(f"  • Method: {rep.method} ({rep.data_source}) | Horizon: {rep.total_projected_days} days")
+    print(f"  • Current: Followers={_fmt_int(rep.current_followers)} | Views={_fmt_int(rep.current_views)}")
+    print("-" * 82)
+    for pt in rep.horizons:
+        print(
+            f"  +{pt.horizon_days:>4}d ({pt.date}) | Fol: {_fmt_int(pt.followers):>12} (Δ {_fmt_int(pt.gained_followers, True):>10}) | "
+            f"Views: {_fmt_int(pt.views):>14} (Δ {_fmt_int(pt.gained_views, True):>12})"
+        )
+    if rep.milestones:
+        print("-" * 82)
+        for m in rep.milestones:
+            print(f"  🏆 Milestone [{m.metric} >= {_fmt_int(m.milestone)}]: projected on {m.projected_date} (in {m.days_until}d)")
+    print("-" * 82)
+    return 0
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    config = SocialBladeConfig.resolve(
+        cli_db_path=args.db_path,
+        cli_browser_backend=getattr(args, "browser_backend", None),
+        cli_cdp_url=getattr(args, "cdp_url", None),
+    )
+    plat = normalize_platform(args.platform) or "youtube"
+    query_str = " ".join(args.query).strip()
+    try:
+        rep = execute_search_flow(query_str, config, platform=plat, limit=args.limit)
+    except ProviderError as exc:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(exc), "query": query_str, "platform": plat}, indent=2))
+        else:
+            print(f"❌ Error searching '{query_str}' on {plat}: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(rep.as_dict(), ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"🔎 Creator Discovery Search: '{rep.query}' ({rep.platform.upper()} — {rep.count} matches via {rep.data_source})")
+    print("-" * 88)
+    for c in rep.candidates:
+        print(
+            f"  • {c.display_name[:22]:<22} | {c.canonical_id:<32} | Fol: {_fmt_int(c.followers):>11} | Views: {_fmt_int(c.views):>12}"
+        )
+    print("-" * 88)
+    return 0
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    config = SocialBladeConfig.resolve(
+        cli_db_path=args.db_path,
+        cli_days=args.days,
+        cli_browser_backend=getattr(args, "browser_backend", None),
+        cli_cdp_url=getattr(args, "cdp_url", None),
+    )
+    ledger = SnapshotLedger(config.db_path.value)
+    days = int(config.default_days.value)
+    max_iters = max(1, int(args.iterations))
+    interval_sec = max(0.0, float(args.interval))
+    runs: list[dict[str, Any]] = []
+
+    for it in range(1, max_iters + 1):
+        ts = datetime.now(timezone.utc).isoformat()
+        batch: list[dict[str, Any]] = []
+        for raw_t in args.targets:
+            try:
+                t = parse_target(raw_t, explicit_platform=args.platform)
+                rep = execute_stats_flow(
+                    t, config, ledger, days=days, requested_tier=args.tier, persist=True
+                )
+                posts_saved = 0
+                if args.with_posts and t.platform in ("youtube", "twitter"):
+                    p_res = execute_posts_flow(t, config, ledger, limit=10, persist=True, known_canonical_id=rep.canonical_id)
+                    posts_saved = len(p_res.get("posts") or [])
+                batch.append({
+                    "target": raw_t,
+                    "ok": True,
+                    "canonical_id": rep.canonical_id,
+                    "followers": rep.totals.get("followers"),
+                    "views": rep.totals.get("views"),
+                    "posts_saved": posts_saved,
+                    "source": rep.data_source,
+                })
+            except Exception as exc:
+                batch.append({"target": raw_t, "ok": False, "error": str(exc)})
+        runs.append({"iteration": it, "timestamp": ts, "results": batch})
+        if not args.json:
+            print(f"⏱️  [Watch #{it}/{max_iters} @ {ts}] Reconciled {len(batch)} target(s) into SQLite SSOT")
+            for item in batch:
+                if item["ok"]:
+                    print(f"   ✅ {item['canonical_id']:<34} | Fol: {_fmt_int(item['followers']):>11} | Source: {item['source']}")
+                else:
+                    print(f"   ⚠️ {item['target']}: {item['error']}")
+        if it < max_iters and interval_sec > 0:
+            time.sleep(interval_sec)
+
+    if args.json:
+        print(json.dumps({"iterations": max_iters, "runs": runs}, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_ledger(args: argparse.Namespace) -> int:
     config = SocialBladeConfig.resolve(
         cli_db_path=args.db_path,
@@ -340,23 +583,24 @@ def cmd_ledger(args: argparse.Namespace) -> int:
             return 0
         print(f"🗄️  SQLite Snapshot Ledger SSOT ({summary['db_path']})")
         print(
-            f"   Tracked Creators: {summary['creators_count']} | Aliases: {summary['aliases_count']} | Daily Snapshots: {summary['daily_snapshots_count']}"
+            f"   Tracked Creators: {summary['creators_count']} | Aliases: {summary['aliases_count']} | "
+            f"Daily Snapshots: {summary['daily_snapshots_count']} | Stored Posts: {summary['posts_count']}"
         )
-        print("-" * 92)
+        print("-" * 100)
         if not creators:
             print("  (No creators stored yet. Run `socialblade stats <target>` to record snapshots.)")
         else:
             print(
-                f"  {'Canonical ID':<34} | {'Display Name':<20} | {'Snaps':>5} | {'Date Range':<23} | {'Last Source'}"
+                f"  {'Canonical ID':<34} | {'Display Name':<20} | {'Snaps':>5} | {'Posts':>5} | {'Date Range':<23} | {'Last Source'}"
             )
-            print("  " + "-" * 88)
+            print("  " + "-" * 96)
             for c in creators:
                 dr = f"{c.get('first_date') or '--'}..{c.get('last_date') or '--'}"
                 print(
                     f"  {c['canonical_id']:<34} | {str(c.get('display_name') or '')[:20]:<20} | "
-                    f"{int(c.get('snapshot_count') or 0):>5} | {dr:<23} | {c.get('last_source') or '--'}"
+                    f"{int(c.get('snapshot_count') or 0):>5} | {int(c.get('posts_count') or 0):>5} | {dr:<23} | {c.get('last_source') or '--'}"
                 )
-        print("-" * 92)
+        print("-" * 100)
         return 0
 
     if action == "history":
@@ -422,6 +666,7 @@ def cmd_explain(args: argparse.Namespace) -> int:
     try:
         target = _resolve_positional_target(args.target, explicit_platform=args.platform)
         plan = select_tier_plan(target, config, requested_tier=args.tier)
+        posts_plan = select_posts_plan(target, config)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -443,6 +688,7 @@ def cmd_explain(args: argparse.Namespace) -> int:
             ),
         },
         "tier_execution_plan": plan,
+        "posts_execution_plan": posts_plan,
         "pagination_and_window_contract": {
             "requested_days": config.default_days.value,
             "ssr_default_days": 15 if target.platform != "twitter" else 0,
@@ -456,6 +702,7 @@ def cmd_explain(args: argparse.Namespace) -> int:
             "db_path": str(config.db_path.value),
             "known_canonical_id": known_canonical,
             "stored_snapshots_count": int(creator_meta["snapshot_count"]) if creator_meta else 0,
+            "stored_posts_count": int(creator_meta.get("posts_count") or 0) if creator_meta else 0,
             "first_snapshot_date": creator_meta.get("first_snapshot_date") if creator_meta else None,
             "last_snapshot_date": creator_meta.get("last_snapshot_date") if creator_meta else None,
         },
@@ -477,12 +724,14 @@ def cmd_explain(args: argparse.Namespace) -> int:
     print(f"  2. Matched Rule:        [{target.matched_rule_id}] {target.matched_rule_description}")
     print(f"  3. Selected Tier Plan:  Primary = {plan['primary_tier']} | Fallbacks = {plan.get('fallback_tiers', [])}")
     print(f"     • Rationale:         {plan['rationale']}")
+    print(f"     • Posts Plan:        {posts_plan['primary_provider']} — {posts_plan['rationale']}")
     print(
         f"  4. Window & Pagination: Requested = {config.default_days.value}d (Expands 15d SSR to 30d via tRPC; flags partial windows)"
     )
     print(
         f"  5. Local SQLite SSOT:   Canonical ID = {known_canonical or '(Not yet recorded)'} "
-        f"(Stored Snapshots: {explanation['local_ssot_ledger_state']['stored_snapshots_count']})"
+        f"(Snapshots: {explanation['local_ssot_ledger_state']['stored_snapshots_count']}, "
+        f"Posts: {explanation['local_ssot_ledger_state']['stored_posts_count']})"
     )
     print("=" * 78)
     return 0
@@ -568,7 +817,8 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
 
     print("\n[2] Subsystem Health Probes")
     print(
-        f"  • SQLite SSOT Ledger  : ✅ Ready ({ledger_info['creators_count']} creators, {ledger_info['daily_snapshots_count']} daily rows)"
+        f"  • SQLite SSOT Ledger  : ✅ Ready ({ledger_info['creators_count']} creators, "
+        f"{ledger_info['daily_snapshots_count']} daily rows, {ledger_info['posts_count']} posts)"
     )
     if matrix_probe["ok"]:
         auth_tag = "Paid Key Active" if matrix_probe["authenticated_mode"] else "Free Sample Verified (query=socialblade)"
@@ -736,6 +986,71 @@ def build_parser() -> argparse.ArgumentParser:
     p_diag.add_argument("--db-path", default=None, help="Override SQLite SSOT database path")
     p_diag.add_argument("--json", action="store_true", help="Output structured JSON")
     p_diag.set_defaults(func=cmd_diagnose)
+
+    # 7. posts
+    p_posts = sub.add_parser("posts", help="Fetch creator historical video/tweet post engagement stream")
+    p_posts.add_argument("target", nargs="+", help="Target creator (e.g. 'youtube @vecyang', 'twitter @HTX_Studio')")
+    p_posts.add_argument("-p", "--platform", choices=list(PLATFORM_ALIASES.keys()), help="Explicit platform override")
+    p_posts.add_argument("-l", "--limit", type=int, default=20, help="Max posts to retrieve (default: 20)")
+    p_posts.add_argument("--browser-backend", choices=["auto", "ego", "cdp", "playwright"], default=None)
+    p_posts.add_argument("--cdp-url", default=None, help="CDP endpoint URL")
+    p_posts.add_argument("--no-save", action="store_true", help="Skip persisting posts to SQLite SSOT")
+    p_posts.add_argument("--db-path", default=None, help="Override SQLite SSOT database path")
+    p_posts.add_argument("--json", action="store_true", help="Output structured JSON")
+    p_posts.set_defaults(func=cmd_posts)
+
+    # 8. timeline
+    p_tl = sub.add_parser("timeline", help="Unified chronological timeline joining daily follower deltas with post engagement")
+    p_tl.add_argument("target", nargs="+", help="Target creator")
+    p_tl.add_argument("-p", "--platform", choices=list(PLATFORM_ALIASES.keys()), help="Explicit platform override")
+    p_tl.add_argument("-d", "--days", type=int, default=None, help="Days of daily history (default: 30)")
+    p_tl.add_argument("--post-limit", type=int, default=20, help="Max recent posts to join (default: 20)")
+    p_tl.add_argument("--tier", choices=["auto", "matrix", "ego", "web", "bridge"], default="auto")
+    p_tl.add_argument("--browser-backend", choices=["auto", "ego", "cdp", "playwright"], default=None)
+    p_tl.add_argument("--cdp-url", default=None, help="CDP endpoint URL")
+    p_tl.add_argument("--no-save", action="store_true", help="Skip persisting to SQLite SSOT")
+    p_tl.add_argument("--db-path", default=None, help="Override SQLite SSOT database path")
+    p_tl.add_argument("--json", action="store_true", help="Output structured JSON")
+    p_tl.set_defaults(func=cmd_timeline)
+
+    # 9. projections
+    p_proj = sub.add_parser("projections", help="Fetch 5-year Holt's Linear future growth projections and milestone crossings")
+    p_proj.add_argument("target", nargs="+", help="Target creator")
+    p_proj.add_argument("-p", "--platform", choices=list(PLATFORM_ALIASES.keys()), help="Explicit platform override")
+    p_proj.add_argument("--max-days", type=int, default=1826, help="Max forecast horizon in days (default: 1826)")
+    p_proj.add_argument("--full-series", action="store_true", help="Include full daily forecast array in --json output")
+    p_proj.add_argument("--tier", choices=["auto", "matrix", "ego", "web", "bridge"], default="auto")
+    p_proj.add_argument("--browser-backend", choices=["auto", "ego", "cdp", "playwright"], default=None)
+    p_proj.add_argument("--cdp-url", default=None, help="CDP endpoint URL")
+    p_proj.add_argument("--db-path", default=None, help="Override SQLite SSOT database path")
+    p_proj.add_argument("--json", action="store_true", help="Output structured JSON")
+    p_proj.set_defaults(func=cmd_projections)
+
+    # 10. search
+    p_search = sub.add_parser("search", help="Search & discover creators across Social Blade tRPC or platform bridges")
+    p_search.add_argument("query", nargs="+", help="Creator search query")
+    p_search.add_argument("-p", "--platform", choices=list(PLATFORM_ALIASES.keys()), default="youtube")
+    p_search.add_argument("-l", "--limit", type=int, default=10, help="Max results (default: 10)")
+    p_search.add_argument("--browser-backend", choices=["auto", "ego", "cdp", "playwright"], default=None)
+    p_search.add_argument("--cdp-url", default=None, help="CDP endpoint URL")
+    p_search.add_argument("--db-path", default=None, help="Override SQLite SSOT database path")
+    p_search.add_argument("--json", action="store_true", help="Output structured JSON")
+    p_search.set_defaults(func=cmd_search)
+
+    # 11. watch
+    p_watch = sub.add_parser("watch", help="Scheduled snapshot & post reconciliation loop for cron/launchd")
+    p_watch.add_argument("targets", nargs="+", help="1 or more creator targets to reconcile")
+    p_watch.add_argument("-p", "--platform", default=None, help="Default platform for bare handles")
+    p_watch.add_argument("-d", "--days", type=int, default=None, help="History window in days")
+    p_watch.add_argument("--iterations", type=int, default=1, help="Number of polling iterations (default: 1)")
+    p_watch.add_argument("--interval", type=float, default=0.0, help="Seconds between iterations (default: 0)")
+    p_watch.add_argument("--with-posts", action="store_true", help="Also reconcile recent creator posts")
+    p_watch.add_argument("--tier", choices=["auto", "matrix", "ego", "web", "bridge"], default="auto")
+    p_watch.add_argument("--browser-backend", choices=["auto", "ego", "cdp", "playwright"], default=None)
+    p_watch.add_argument("--cdp-url", default=None, help="CDP endpoint URL")
+    p_watch.add_argument("--db-path", default=None, help="Override SQLite SSOT database path")
+    p_watch.add_argument("--json", action="store_true", help="Output structured JSON")
+    p_watch.set_defaults(func=cmd_watch)
 
     return parser
 

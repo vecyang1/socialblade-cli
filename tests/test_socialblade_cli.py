@@ -305,5 +305,130 @@ class TestConfigAndMatrixParser(unittest.TestCase):
             )
 
 
+class TestPostsTimelineProjectionsSearchWatch(unittest.TestCase):
+    """Test v1.2.0 posts SSOT, timeline join, projections, search, and watch CLI flows."""
+
+    def setUp(self) -> None:
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmp_dir.name) / "test_v12.db"
+        self.ledger = SnapshotLedger(self.db_path)
+
+    def tearDown(self) -> None:
+        self.tmp_dir.cleanup()
+
+    def test_creator_posts_ssot_no_redundant_engagement_column(self) -> None:
+        conn = sqlite3.connect(str(self.db_path))
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(creator_posts)").fetchall()]
+        conn.close()
+        self.assertNotIn("engagement_rate", cols)
+
+    def test_posts_upsert_and_timeline_join(self) -> None:
+        from socialblade_core.ledger import derive_timeline_entries
+        from socialblade_core.types import PostPoint
+
+        posts = [
+            PostPoint(
+                post_uid="youtube:vid1",
+                canonical_id="youtube:UC8kOCg0Cf8Kw7b_YikLlAig",
+                platform="youtube",
+                post_id="vid1",
+                published_date="2026-10-22",
+                title="Test Video 1",
+                views=1000,
+                likes=80,
+                comments=20,
+                source="yt_data",
+            )
+        ]
+        saved = self.ledger.upsert_posts("youtube:UC8kOCg0Cf8Kw7b_YikLlAig", "youtube", posts, username="vecyang")
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].engagement_rate, 10.0)
+
+        daily = [
+            DailyPoint(date="2026-10-21", followers=868, views=320000, posts=84),
+            DailyPoint(date="2026-10-22", followers=870, views=321000, posts=85),
+        ]
+        tl, summary = derive_timeline_entries(derive_daily_deltas(daily), saved)
+        self.assertEqual(len(tl), 2)
+        self.assertEqual(tl[-1].published_posts_count, 1)
+        self.assertEqual(tl[-1].published_engagement_rate, 10.0)
+        self.assertEqual(summary["total_posts_analyzed"], 1)
+
+    def test_cli_posts_projections_search_watch_handlers(self) -> None:
+        import io
+        from socialblade_core.types import PostPoint, SearchCandidate, SearchReport
+
+        fake_posts = [
+            PostPoint(
+                post_uid="youtube:v1",
+                canonical_id="youtube:UC8kOCg0Cf8Kw7b_YikLlAig",
+                platform="youtube",
+                post_id="v1",
+                published_date="2026-10-23",
+                title="AI Agent CLI",
+                views=500,
+                likes=50,
+                comments=5,
+                source="yt_data",
+            )
+        ]
+        with mock.patch(
+            "socialblade_core.providers.fetch_creator_posts",
+            return_value=("youtube:UC8kOCg0Cf8Kw7b_YikLlAig", "Vec", "@vecyang", fake_posts, "yt_data"),
+        ):
+            buf = io.StringIO()
+            with mock.patch("sys.stdout", buf):
+                rc = main(["posts", "youtube", "@vecyang", "--limit", "5", "--db-path", str(self.db_path), "--json"])
+            self.assertEqual(rc, 0)
+            out = json.loads(buf.getvalue())
+            self.assertNotIn("_post_objects", out)
+            self.assertEqual(out["posts"][0]["engagement_rate"], 11.0)
+
+        fake_rep = CreatorStatsReport(
+            canonical_id="youtube:UC8kOCg0Cf8Kw7b_YikLlAig",
+            platform="youtube",
+            platform_id="UC8kOCg0Cf8Kw7b_YikLlAig",
+            username="vecyang",
+            display_name="Vec",
+            handle="@vecyang",
+            totals={"followers": 950, "views": 320000, "posts": 85},
+            growth=GrowthSummary(daily_avg_followers=5.0, daily_avg_views=1000.0),
+            daily=[
+                DailyPoint(date="2026-10-22", followers=945, views=319000, posts=85),
+                DailyPoint(date="2026-10-23", followers=950, views=320000, posts=85),
+            ],
+            data_source="yt_data+local_ledger",
+        )
+        with mock.patch("socialblade_core.providers.fetch_platform_bridge", return_value=fake_rep):
+            buf_p = io.StringIO()
+            with mock.patch("sys.stdout", buf_p):
+                rc_p = main(["projections", "youtube", "@vecyang", "--tier", "bridge", "--db-path", str(self.db_path), "--json"])
+            self.assertEqual(rc_p, 0)
+            proj_out = json.loads(buf_p.getvalue())
+            self.assertEqual(proj_out["method"], "velocity_linear")
+            self.assertTrue(len(proj_out["milestones"]) > 0)
+
+            buf_w = io.StringIO()
+            with mock.patch("sys.stdout", buf_w):
+                rc_w = main(["watch", "youtube:@vecyang", "--tier", "bridge", "--iterations", "1", "--db-path", str(self.db_path), "--json"])
+            self.assertEqual(rc_w, 0)
+            watch_out = json.loads(buf_w.getvalue())
+            self.assertTrue(watch_out["runs"][0]["results"][0]["ok"])
+
+        fake_search = SearchReport(
+            query="vecyang",
+            platform="youtube",
+            count=1,
+            candidates=[SearchCandidate(platform="youtube", platform_id="UC8kOCg0Cf8Kw7b_YikLlAig", canonical_id="youtube:UC8kOCg0Cf8Kw7b_YikLlAig", username="vecyang", display_name="Vec", followers=950)],
+            data_source="ego_trpc_search",
+        )
+        with mock.patch("socialblade_core.cli.execute_search_flow", return_value=fake_search):
+            buf_s = io.StringIO()
+            with mock.patch("sys.stdout", buf_s):
+                rc_s = main(["search", "vecyang", "--platform", "youtube", "--json"])
+            self.assertEqual(rc_s, 0)
+            self.assertEqual(json.loads(buf_s.getvalue())["count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

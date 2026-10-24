@@ -1,6 +1,6 @@
 """Social Blade & Cross-Platform Creator Growth Analytics Core (`socialblade`)."""
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 from .browser import BrowserError, backend_availability, evaluate_on_socialblade, resolve_backend
 from .config import ConfigValue, SocialBladeConfig
@@ -8,11 +8,19 @@ from .ledger import (
     SnapshotLedger,
     build_completeness_receipt,
     derive_daily_deltas,
+    derive_post_engagement,
+    derive_posts_engagement,
+    derive_timeline_entries,
     enrich_growth_from_daily,
 )
 from .providers import (
     ProviderError,
+    execute_posts_flow,
+    execute_projections_flow,
+    execute_search_flow,
     execute_stats_flow,
+    execute_timeline_flow,
+    fetch_creator_posts,
     fetch_ego_favorites,
     fetch_ego_trpc,
     fetch_matrix_api,
@@ -23,39 +31,70 @@ from .router import (
     build_socialblade_web_path,
     normalize_platform,
     parse_target,
+    select_posts_plan,
     select_tier_plan,
 )
 from .types import (
     CompletenessReceipt,
+    CreatorProjectionReport,
     CreatorStatsReport,
+    CreatorTimelineReport,
     DailyPoint,
     GrowthSummary,
+    MilestoneCrossing,
     MonthlyPoint,
     ParsedTarget,
+    PostPoint,
+    ProjectionPoint,
+    SearchCandidate,
+    SearchReport,
+    TimelineDayEntry,
 )
 
 __all__ = [
+    "BrowserError",
     "CompletenessReceipt",
     "ConfigValue",
+    "CreatorProjectionReport",
     "CreatorStatsReport",
+    "CreatorTimelineReport",
     "DailyPoint",
     "GrowthSummary",
+    "MilestoneCrossing",
     "MonthlyPoint",
     "ParsedTarget",
+    "PostPoint",
+    "ProjectionPoint",
     "ProviderError",
     "SUPPORTED_PLATFORMS",
+    "SearchCandidate",
+    "SearchReport",
     "SnapshotLedger",
     "SocialBladeConfig",
+    "TimelineDayEntry",
+    "backend_availability",
     "build_completeness_receipt",
     "build_socialblade_web_path",
     "derive_daily_deltas",
+    "derive_post_engagement",
+    "derive_posts_engagement",
+    "derive_timeline_entries",
     "enrich_growth_from_daily",
+    "evaluate_on_socialblade",
+    "execute_posts_flow",
+    "execute_projections_flow",
+    "execute_search_flow",
     "execute_stats_flow",
+    "execute_timeline_flow",
+    "fetch_creator_posts",
     "fetch_ego_favorites",
     "fetch_ego_trpc",
     "fetch_matrix_api",
     "fetch_platform_bridge",
     "normalize_platform",
     "parse_target",
+    "resolve_backend",
+    "select_posts_plan",
     "select_tier_plan",
 ]
+

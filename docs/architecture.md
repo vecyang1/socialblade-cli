@@ -42,9 +42,9 @@ It directly solves three structural gaps in existing open-source Social Blade wr
 | `src/socialblade_core/types.py` | Schema-first dataclasses (`ParsedTarget`, `DailyPoint`, `MonthlyPoint`, `GrowthSummary`, `CompletenessReceipt`, `CreatorStatsReport`). |
 | `src/socialblade_core/browser.py` | Multi-backend browser execution engine (`ego`, `cdp`, `playwright`) and single source of truth for in-page JS (`STATS_FN_JS`, `FAVORITES_FN_JS`). |
 | `src/socialblade_core/router.py` | Deterministic URL/handle parser (`R1`–`R11` rules) and tier execution planner (`select_tier_plan`) powering `socialblade explain`. |
-| `src/socialblade_core/ledger.py` | SQLite SSOT (`snapshots.db`) managing `creators`, `creator_aliases`, and `daily_snapshots` with Read-After-Write verification and dynamic delta calculation (`derive_daily_deltas`). |
-| `src/socialblade_core/providers.py` | 3-Tier provider engine (`fetch_matrix_api`, `fetch_ego_trpc`, `fetch_ego_favorites`, `fetch_platform_bridge`, `execute_stats_flow`). |
-| `src/socialblade_core/cli.py` | CLI subcommand router (`stats`, `compare`, `favorites`, `ledger`, `explain`, `diagnose`). |
+| `src/socialblade_core/ledger.py` | SQLite SSOT (`snapshots.db`) managing `creators`, `creator_aliases`, `daily_snapshots`, and `creator_posts` with Read-After-Write verification and dynamic delta/engagement derivation. |
+| `src/socialblade_core/providers.py` | 3-Tier provider engine (`execute_stats_flow`, `execute_posts_flow`, `execute_timeline_flow`, `execute_projections_flow`, `execute_search_flow`). |
+| `src/socialblade_core/cli.py` | CLI subcommand router (`stats`, `compare`, `favorites`, `posts`, `timeline`, `projections`, `search`, `watch`, `ledger`, `explain`, `diagnose`). |
 | `tests/test_socialblade_cli.py` | Unit and two-sided verification test suite. |
 
 ## Data And Storage
@@ -53,6 +53,7 @@ It directly solves three structural gaps in existing open-source Social Blade wr
   - `creators`: `canonical_id TEXT PRIMARY KEY` (`<platform>:<immutable_id>`), `platform`, `platform_id`, `username`, `display_name`, `handle`, `grade`, `sb_rank`, `follower_rank`, `views_rank`, `country`, `category`, `created_at`, `last_source`, `updated_at`.
   - `creator_aliases`: `alias_key TEXT PRIMARY KEY` (`<platform>:<lower_alias>`), `canonical_id TEXT NOT NULL`.
   - `daily_snapshots`: `(canonical_id, snapshot_date)` primary key with raw point-in-time counters (`followers`, `following`, `views`, `posts`, `likes`, `engagement_rate`, `source`, `fetched_at`). **Zero static delta columns** are stored.
+  - `creator_posts`: `post_uid TEXT PRIMARY KEY` (`<platform>:<post_id>`) storing raw post observations (`views`, `likes`, `comments`, `shares`, `bookmarks`). `engagement_rate` is derived dynamically on read.
 
 ## Integrations And External Services
 

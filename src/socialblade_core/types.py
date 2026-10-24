@@ -67,12 +67,25 @@ def to_optional_float(val: Any) -> float | None:
 
 
 def normalize_date_str(raw: Any) -> str:
-    """Normalize ISO timestamp or date string to YYYY-MM-DD."""
+    """Normalize ISO timestamp, RFC-2822 Twitter timestamp, or YYYYMMDD to YYYY-MM-DD."""
     s = str(raw or "").strip()
+    if not s:
+        return ""
     if "T" in s:
         return s.split("T", 1)[0]
     if len(s) >= 10 and s[4:5] == "-" and s[7:8] == "-":
         return s[:10]
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+    # Handle Twitter RFC-2822 timestamps such as "Wed Oct 21 16:31:06 +0000 2026"
+    if any(m in s for m in ("Jan ", "Feb ", "Mar ", "Apr ", "May ", "Jun ", "Jul ", "Aug ", "Sep ", "Oct ", "Nov ", "Dec ")):
+        try:
+            from email.utils import parsedate_to_datetime
+
+            dt = parsedate_to_datetime(s)
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
     return s
 
 
@@ -223,3 +236,180 @@ class CreatorStatsReport:
         d = asdict(self)
         d.pop("_untrimmed_daily", None)
         return d
+
+
+@dataclass
+class PostPoint:
+    """Single historical post / video / tweet item with engagement metrics.
+
+    Note: engagement_rate is DERIVED dynamically on read from
+    (likes + comments + shares) / views * 100 (SSOT invariant: never persist
+    redundant derived rate columns in SQLite `creator_posts`).
+    """
+
+    post_uid: str  # "<platform>:<post_id>"
+    canonical_id: str  # "<platform>:<creator_id>"
+    platform: str
+    post_id: str
+    published_date: str  # YYYY-MM-DD
+    published_at: str | None = None
+    title: str = ""
+    url: str = ""
+    post_type: str = "post"  # "video" | "short" | "tweet" | "post"
+    views: int | None = None
+    likes: int | None = None
+    comments: int | None = None
+    shares: int | None = None
+    bookmarks: int | None = None
+    duration: str | None = None
+    source: str = "unknown"
+    engagement_rate: float | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class TimelineDayEntry:
+    """Unified chronological day joining daily follower/view deltas with published posts."""
+
+    date: str  # YYYY-MM-DD
+    followers: int | None = None
+    delta_followers: int | None = None
+    views: int | None = None
+    delta_views: int | None = None
+    total_posts: int | None = None
+    delta_posts: int | None = None
+    published_posts_count: int = 0
+    published_post_views: int = 0
+    published_post_likes: int = 0
+    published_post_comments: int = 0
+    published_post_shares: int = 0
+    published_engagement_rate: float | None = None
+    published_posts: list[PostPoint] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class CreatorTimelineReport:
+    """Unified follower growth delta + historical post engagement timeline report."""
+
+    canonical_id: str
+    platform: str
+    platform_id: str
+    username: str
+    display_name: str
+    handle: str | None = None
+    stats_source: str = "unknown"
+    posts_source: str = "unknown"
+    ledger_verified: bool = False
+    completeness: CompletenessReceipt = field(
+        default_factory=lambda: CompletenessReceipt(
+            requested_days=30,
+            returned_days=0,
+            is_complete=False,
+            pagination_verified=False,
+        )
+    )
+    posts_completeness: CompletenessReceipt = field(
+        default_factory=lambda: CompletenessReceipt(
+            requested_days=20,
+            returned_days=0,
+            is_complete=False,
+            pagination_verified=False,
+        )
+    )
+    engagement_summary: dict[str, Any] = field(default_factory=dict)
+    timeline: list[TimelineDayEntry] = field(default_factory=list)
+    posts: list[PostPoint] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ProjectionPoint:
+    """Single future forecast point (Holt's linear or velocity projection)."""
+
+    date: str  # YYYY-MM-DD
+    horizon_days: int
+    followers: int | None = None
+    views: int | None = None
+    gained_followers: int | None = None
+    gained_views: int | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class MilestoneCrossing:
+    """Projected date when a creator crosses a round subscriber/follower or view milestone."""
+
+    metric: str  # "followers" | "views"
+    milestone: int
+    projected_date: str
+    days_until: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class CreatorProjectionReport:
+    """Future projections and milestone crossing report (up to 5 years / 1,826 days)."""
+
+    canonical_id: str
+    platform: str
+    platform_id: str
+    username: str
+    display_name: str
+    handle: str | None = None
+    current_followers: int | None = None
+    current_views: int | None = None
+    method: str = "holts_linear"
+    total_projected_days: int = 0
+    horizons: list[ProjectionPoint] = field(default_factory=list)
+    milestones: list[MilestoneCrossing] = field(default_factory=list)
+    series: list[ProjectionPoint] = field(default_factory=list)
+    data_source: str = "unknown"
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class SearchCandidate:
+    """Single creator search match."""
+
+    platform: str
+    platform_id: str
+    canonical_id: str
+    username: str
+    display_name: str
+    handle: str | None = None
+    followers: int | None = None
+    views: int | None = None
+    posts: int | None = None
+    verified: bool | None = None
+    source: str = "unknown"
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class SearchReport:
+    """Creator discovery & search report."""
+
+    query: str
+    platform: str
+    count: int
+    candidates: list[SearchCandidate] = field(default_factory=list)
+    data_source: str = "unknown"
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+

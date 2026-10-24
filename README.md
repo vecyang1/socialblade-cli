@@ -128,6 +128,31 @@ socialblade ledger history youtube:@vecyang --days 30
 socialblade ledger history twitter:@HTX_Studio --json
 ```
 
+### 6. Post Engagement Stream & Unified Timeline (`posts` & `timeline`)
+
+```bash
+# Fetch recent YouTube videos or Twitter/X tweets with derived engagement_rate (ER%)
+socialblade posts youtube @vecyang --limit 10
+socialblade posts twitter @HTX_Studio --limit 5
+
+# Join daily follower/view deltas with published posts on each date (YYYY-MM-DD)
+socialblade timeline youtube @vecyang --days 14
+socialblade timeline twitter @HTX_Studio --days 14 --post-limit 5
+```
+
+### 7. 5-Year Future Projections, Creator Search & Watch Loop (`projections`, `search`, `watch`)
+
+```bash
+# 5-year (1,826-day) Social Blade Holt's Linear projections & milestone crossing dates
+socialblade projections youtube @vecyang
+
+# Search & discover creators across Social Blade tRPC or platform bridges
+socialblade search vecyang --platform youtube
+
+# Scheduled snapshot & post reconciliation loop for cron/launchd
+socialblade watch youtube:@vecyang twitter:@HTX_Studio --iterations 1 --with-posts
+```
+
 ---
 
 ## Configuration & Environment Variables

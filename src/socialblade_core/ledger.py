@@ -14,16 +14,19 @@ Enforces three core architectural invariants:
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .types import (
     CompletenessReceipt,
     CreatorStatsReport,
     DailyPoint,
     GrowthSummary,
+    PostPoint,
+    TimelineDayEntry,
     normalize_date_str,
 )
 
@@ -70,7 +73,174 @@ CREATE TABLE IF NOT EXISTS daily_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_canonical_date
     ON daily_snapshots(canonical_id, snapshot_date ASC);
+
+CREATE TABLE IF NOT EXISTS creator_posts (
+    post_uid TEXT PRIMARY KEY,
+    canonical_id TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    post_id TEXT NOT NULL,
+    published_date TEXT NOT NULL,
+    published_at TEXT,
+    title TEXT,
+    url TEXT,
+    post_type TEXT,
+    views INTEGER,
+    likes INTEGER,
+    comments INTEGER,
+    shares INTEGER,
+    bookmarks INTEGER,
+    duration TEXT,
+    source TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    FOREIGN KEY (canonical_id) REFERENCES creators(canonical_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_posts_canonical_date
+    ON creator_posts(canonical_id, published_date DESC);
 """
+
+
+def derive_post_engagement(post: PostPoint) -> PostPoint:
+    """Derive per-post engagement rate dynamically from raw counters (SSOT invariant)."""
+    rate: float | None = post.engagement_rate
+    if post.views is not None and post.views > 0:
+        has_interaction = any(
+            x is not None for x in (post.likes, post.comments, post.shares)
+        )
+        if has_interaction:
+            interactions = (post.likes or 0) + (post.comments or 0) + (post.shares or 0)
+            rate = round((interactions / float(post.views)) * 100.0, 2)
+    return PostPoint(
+        post_uid=post.post_uid,
+        canonical_id=post.canonical_id,
+        platform=post.platform,
+        post_id=post.post_id,
+        published_date=normalize_date_str(post.published_date),
+        published_at=post.published_at,
+        title=post.title,
+        url=post.url,
+        post_type=post.post_type,
+        views=post.views,
+        likes=post.likes,
+        comments=post.comments,
+        shares=post.shares,
+        bookmarks=post.bookmarks,
+        duration=post.duration,
+        source=post.source,
+        engagement_rate=rate,
+    )
+
+
+def derive_posts_engagement(posts: list[PostPoint]) -> list[PostPoint]:
+    """Derive engagement rates and sort posts newest-first."""
+    enriched = [derive_post_engagement(p) for p in posts]
+    return sorted(
+        enriched,
+        key=lambda p: (p.published_date or "", p.published_at or "", p.post_id or ""),
+        reverse=True,
+    )
+
+
+def derive_timeline_entries(
+    daily: list[DailyPoint],
+    posts: list[PostPoint],
+) -> tuple[list[TimelineDayEntry], dict[str, Any]]:
+    """Join chronological daily follower/view deltas with posts published on each date."""
+    derived_daily = derive_daily_deltas(daily)
+    derived_posts = derive_posts_engagement(posts)
+
+    daily_by_date: dict[str, DailyPoint] = {pt.date: pt for pt in derived_daily if pt.date}
+    posts_by_date: dict[str, list[PostPoint]] = {}
+    for p in derived_posts:
+        d = normalize_date_str(p.published_date)
+        if not d:
+            continue
+        posts_by_date.setdefault(d, []).append(p)
+
+    all_dates = sorted(set(daily_by_date.keys()) | set(posts_by_date.keys()))
+    timeline: list[TimelineDayEntry] = []
+
+    for d_str in all_dates:
+        dp = daily_by_date.get(d_str)
+        day_posts = posts_by_date.get(d_str, [])
+        p_views = sum((x.views or 0) for x in day_posts)
+        p_likes = sum((x.likes or 0) for x in day_posts)
+        p_comments = sum((x.comments or 0) for x in day_posts)
+        p_shares = sum((x.shares or 0) for x in day_posts)
+        p_eng: float | None = None
+        if day_posts and p_views > 0:
+            p_eng = round(((p_likes + p_comments + p_shares) / float(p_views)) * 100.0, 2)
+
+        timeline.append(
+            TimelineDayEntry(
+                date=d_str,
+                followers=dp.followers if dp else None,
+                delta_followers=dp.delta_followers if dp else None,
+                views=(dp.views if dp.views is not None else dp.likes) if dp else None,
+                delta_views=dp.delta_views if dp else None,
+                total_posts=dp.posts if dp else None,
+                delta_posts=dp.delta_posts if dp else None,
+                published_posts_count=len(day_posts),
+                published_post_views=p_views,
+                published_post_likes=p_likes,
+                published_post_comments=p_comments,
+                published_post_shares=p_shares,
+                published_engagement_rate=p_eng,
+                published_posts=day_posts,
+            )
+        )
+
+    total_p_views = sum((p.views or 0) for p in derived_posts)
+    total_p_likes = sum((p.likes or 0) for p in derived_posts)
+    total_p_comments = sum((p.comments or 0) for p in derived_posts)
+    total_p_shares = sum((p.shares or 0) for p in derived_posts)
+    cnt = len(derived_posts)
+    avg_eng = (
+        round(((total_p_likes + total_p_comments + total_p_shares) / float(total_p_views)) * 100.0, 2)
+        if total_p_views > 0
+        else None
+    )
+    top_post_obj = max(derived_posts, key=lambda p: (p.views or 0, p.likes or 0)) if derived_posts else None
+    daily_date_set = set(daily_by_date.keys())
+    posts_in_window = sum(1 for p in derived_posts if p.published_date in daily_date_set)
+
+    # Identify top follower/view growth day in daily window and any correlated posts
+    growth_candidates = [e for e in timeline if e.date in daily_date_set and (e.delta_followers is not None or e.delta_views is not None)]
+    top_growth_entry = (
+        max(
+            growth_candidates,
+            key=lambda e: (e.delta_followers or 0, e.delta_views or 0),
+        )
+        if growth_candidates
+        else None
+    )
+
+    summary = {
+        "total_posts_analyzed": cnt,
+        "posts_in_daily_window": posts_in_window,
+        "active_posting_days": len(posts_by_date),
+        "total_post_views": total_p_views,
+        "total_post_likes": total_p_likes,
+        "total_post_comments": total_p_comments,
+        "total_post_shares": total_p_shares,
+        "avg_post_views": round(total_p_views / float(cnt), 1) if cnt > 0 else 0.0,
+        "avg_post_likes": round(total_p_likes / float(cnt), 1) if cnt > 0 else 0.0,
+        "avg_engagement_rate": avg_eng,
+        "top_post": top_post_obj.as_dict() if top_post_obj else None,
+        "top_growth_day": (
+            {
+                "date": top_growth_entry.date,
+                "delta_followers": top_growth_entry.delta_followers,
+                "delta_views": top_growth_entry.delta_views,
+                "published_posts_count": top_growth_entry.published_posts_count,
+                "published_titles": [p.title[:80] for p in top_growth_entry.published_posts],
+            }
+            if top_growth_entry
+            else None
+        ),
+    }
+    return timeline, summary
+
 
 
 def derive_daily_deltas(points: list[DailyPoint]) -> list[DailyPoint]:
@@ -256,12 +426,17 @@ class SnapshotLedger:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(str(self.db_path), timeout=10.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.execute("PRAGMA journal_mode = WAL;")
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -487,6 +662,171 @@ class SnapshotLedger:
             return derived[-limit:]
         return derived
 
+    def upsert_posts(
+        self,
+        canonical_id: str,
+        platform: str,
+        posts: list[PostPoint],
+        *,
+        display_name: str | None = None,
+        username: str | None = None,
+        handle: str | None = None,
+        extra_aliases: list[str] | None = None,
+        limit: int = 20,
+    ) -> list[PostPoint]:
+        """Persist raw post observations into SQLite SSOT, then Read-After-Write verify."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        plat_clean = platform.lower()
+        platform_id = canonical_id.split(":", 1)[1] if ":" in canonical_id else canonical_id
+        full_cid = f"{plat_clean}:{platform_id}"
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO creators (
+                    canonical_id, platform, platform_id, username, display_name,
+                    handle, last_source, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(canonical_id) DO UPDATE SET
+                    username = COALESCE(excluded.username, creators.username),
+                    display_name = COALESCE(excluded.display_name, creators.display_name),
+                    handle = COALESCE(excluded.handle, creators.handle),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    full_cid,
+                    plat_clean,
+                    platform_id,
+                    username or platform_id,
+                    display_name or username or platform_id,
+                    handle,
+                    posts[0].source if posts else "posts_bridge",
+                    now_iso,
+                ),
+            )
+
+            aliases = {
+                platform_id,
+                username or "",
+                (handle or "").lstrip("@"),
+            }
+            if extra_aliases:
+                for a in extra_aliases:
+                    if a:
+                        aliases.add(a.lstrip("@"))
+            for alias in aliases:
+                cl = alias.strip().lower()
+                if not cl:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO creator_aliases (alias_key, canonical_id, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(alias_key) DO UPDATE SET
+                        canonical_id = excluded.canonical_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (f"{plat_clean}:{cl}", full_cid, now_iso),
+                )
+
+            for p in posts:
+                post_id_clean = str(p.post_id or "").strip()
+                if not post_id_clean:
+                    continue
+                post_uid = p.post_uid if ":" in (p.post_uid or "") else f"{plat_clean}:{post_id_clean}"
+                norm_date = normalize_date_str(p.published_date)
+                if not norm_date:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO creator_posts (
+                        post_uid, canonical_id, platform, post_id,
+                        published_date, published_at, title, url, post_type,
+                        views, likes, comments, shares, bookmarks, duration,
+                        source, fetched_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(post_uid) DO UPDATE SET
+                        canonical_id = excluded.canonical_id,
+                        published_date = COALESCE(excluded.published_date, creator_posts.published_date),
+                        published_at = COALESCE(excluded.published_at, creator_posts.published_at),
+                        title = COALESCE(excluded.title, creator_posts.title),
+                        url = COALESCE(excluded.url, creator_posts.url),
+                        post_type = COALESCE(excluded.post_type, creator_posts.post_type),
+                        views = COALESCE(excluded.views, creator_posts.views),
+                        likes = COALESCE(excluded.likes, creator_posts.likes),
+                        comments = COALESCE(excluded.comments, creator_posts.comments),
+                        shares = COALESCE(excluded.shares, creator_posts.shares),
+                        bookmarks = COALESCE(excluded.bookmarks, creator_posts.bookmarks),
+                        duration = COALESCE(excluded.duration, creator_posts.duration),
+                        source = excluded.source,
+                        fetched_at = excluded.fetched_at
+                    """,
+                    (
+                        post_uid,
+                        full_cid,
+                        plat_clean,
+                        post_id_clean,
+                        norm_date,
+                        p.published_at,
+                        p.title,
+                        p.url,
+                        p.post_type,
+                        p.views,
+                        p.likes,
+                        p.comments,
+                        p.shares,
+                        p.bookmarks,
+                        p.duration,
+                        p.source,
+                        now_iso,
+                    ),
+                )
+
+        # Read-After-Write verification
+        return self.get_creator_posts(full_cid, limit=limit)
+
+    upsert_creator_posts = upsert_posts
+
+    def get_creator_posts(self, canonical_id: str, limit: int = 20) -> list[PostPoint]:
+        """Read the latest N posts for canonical_id from SQLite SSOT and derive engagement rates."""
+        safe_limit = max(1, int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT post_uid, canonical_id, platform, post_id,
+                       published_date, published_at, title, url, post_type,
+                       views, likes, comments, shares, bookmarks, duration, source
+                FROM creator_posts
+                WHERE canonical_id = ?
+                ORDER BY published_date DESC, COALESCE(published_at, '') DESC, post_id DESC
+                LIMIT ?
+                """,
+                (canonical_id, safe_limit),
+            ).fetchall()
+
+        raw_posts = [
+            PostPoint(
+                post_uid=str(r["post_uid"]),
+                canonical_id=str(r["canonical_id"]),
+                platform=str(r["platform"]),
+                post_id=str(r["post_id"]),
+                published_date=str(r["published_date"]),
+                published_at=r["published_at"],
+                title=str(r["title"] or ""),
+                url=str(r["url"] or ""),
+                post_type=str(r["post_type"] or "post"),
+                views=r["views"],
+                likes=r["likes"],
+                comments=r["comments"],
+                shares=r["shares"],
+                bookmarks=r["bookmarks"],
+                duration=r["duration"],
+                source=str(r["source"] or "sqlite_ssot"),
+            )
+            for r in rows
+        ]
+        return derive_posts_engagement(raw_posts)
+
     def get_creator_summary(self, canonical_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -494,7 +834,8 @@ class SnapshotLedger:
                 SELECT c.*,
                        COUNT(s.snapshot_date) AS snapshot_count,
                        MIN(s.snapshot_date) AS first_snapshot_date,
-                       MAX(s.snapshot_date) AS last_snapshot_date
+                       MAX(s.snapshot_date) AS last_snapshot_date,
+                       (SELECT COUNT(*) FROM creator_posts p WHERE p.canonical_id = c.canonical_id) AS posts_count
                 FROM creators c
                 LEFT JOIN daily_snapshots s ON c.canonical_id = s.canonical_id
                 WHERE c.canonical_id = ?
@@ -513,7 +854,8 @@ class SnapshotLedger:
                            c.handle, c.grade, c.sb_rank, c.last_source, c.updated_at,
                            COUNT(s.snapshot_date) AS snapshot_count,
                            MIN(s.snapshot_date) AS first_date,
-                           MAX(s.snapshot_date) AS last_date
+                           MAX(s.snapshot_date) AS last_date,
+                           (SELECT COUNT(*) FROM creator_posts p WHERE p.canonical_id = c.canonical_id) AS posts_count
                     FROM creators c
                     LEFT JOIN daily_snapshots s ON c.canonical_id = s.canonical_id
                     WHERE c.platform = ?
@@ -529,7 +871,8 @@ class SnapshotLedger:
                            c.handle, c.grade, c.sb_rank, c.last_source, c.updated_at,
                            COUNT(s.snapshot_date) AS snapshot_count,
                            MIN(s.snapshot_date) AS first_date,
-                           MAX(s.snapshot_date) AS last_date
+                           MAX(s.snapshot_date) AS last_date,
+                           (SELECT COUNT(*) FROM creator_posts p WHERE p.canonical_id = c.canonical_id) AS posts_count
                     FROM creators c
                     LEFT JOIN daily_snapshots s ON c.canonical_id = s.canonical_id
                     GROUP BY c.canonical_id
@@ -543,6 +886,7 @@ class SnapshotLedger:
             c_count = conn.execute("SELECT COUNT(*) FROM creators").fetchone()[0]
             a_count = conn.execute("SELECT COUNT(*) FROM creator_aliases").fetchone()[0]
             s_count = conn.execute("SELECT COUNT(*) FROM daily_snapshots").fetchone()[0]
+            p_count = conn.execute("SELECT COUNT(*) FROM creator_posts").fetchone()[0]
             by_plat = conn.execute(
                 "SELECT platform, COUNT(*) AS cnt FROM creators GROUP BY platform ORDER BY cnt DESC"
             ).fetchall()
@@ -552,5 +896,7 @@ class SnapshotLedger:
             "creators_count": c_count,
             "aliases_count": a_count,
             "daily_snapshots_count": s_count,
+            "posts_count": p_count,
             "by_platform": {str(r["platform"]): int(r["cnt"]) for r in by_plat},
         }
+
