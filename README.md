@@ -58,7 +58,7 @@ Existing open-source Social Blade scrapers and wrappers suffer from three major 
 
 ```bash
 # Clone the repository
-git clone https://github.com/vecyang/socialblade-cli.git
+git clone https://github.com/vecyang1/socialblade-cli.git
 cd socialblade-cli
 
 # Install CLI with Playwright browser support
