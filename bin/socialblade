@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Global CLI entrypoint for socialblade."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+if _SRC_DIR.exists() and str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from socialblade_core.cli import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())

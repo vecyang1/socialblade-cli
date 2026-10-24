@@ -1,0 +1,38 @@
+# Python bytecode & packaging
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+ENV/
+
+# Local environment & runtime data
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+
+# Local agent governance & workspace files (strictly excluded from public repo)
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+VAULT.md
+FILE_MAP_INDEX.md
+PRINCIPLES.md
+MEMORY.md
+DECISION.md
+decisions.md
+progress.md
+task_plan.md
+handoff.md
+operations/
+vault/
+resources/
+graphify-out/
+.DS_Store
