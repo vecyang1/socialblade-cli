@@ -187,7 +187,7 @@ class TestLedgerSSOTAndDerivedDeltas(unittest.TestCase):
             platform="youtube",
             platform_id="UC8kOCg0Cf8Kw7b_YikLlAig",
             username="vecyang",
-            display_name="Vec on Online Income",
+            display_name="Vec Tech Channel",
             handle="@vecyang",
             grade="C-",
             ranks={"sb": 1202315, "followers": 4170},
